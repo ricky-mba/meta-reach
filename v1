@@ -1,571 +1,156 @@
-import os
-import json
-import requests
 import datetime
 import pandas as pd
-import backoff
-from typing import Dict, List, Optional
-
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mtick
-from matplotlib.backends.backend_pdf import PdfPages
-import io
-
+import numpy as np
 from IPython.display import display
-from google.colab import files
+from facebook_business.exceptions import FacebookRequestError
 
-# --- Config ---
-ACCESS_TOKEN_STR = "ACCESS_TOKEN_HERE"
-AD_ACCOUNT_ID_STR = "ACCOUNT_ID_HERE"
-START_DATE_STR = "2025-01-01"
-END_DATE_STR = "2025-06-23"
-FIRST_DAY_OF_WEEK = "Monday"
+# Config
+START_DATE_STR        = "2024-11-1"
+END_DATE_STR          = "2025-12-1"
+FIRST_DAY_OF_WEEK     = "Monday"      
+CAMPAIGN_NAME_CONTAINS = "UK"         
+METRICS_TO_FETCH      = ["reach", "impressions", "frequency", "cpm", "spend"]
 
-# API Settings
-FACEBOOK_GRAPH_API_VERSION = "v22.0"
-METRICS_TO_FETCH = [
-    "reach",
-    "impressions",
-    "frequency",
-    "cpm",
-    "spend"
-]
 
-# Meta API Functions
+def _week_chunks(start_date: datetime.date, end_date: datetime.date, first_day_name: str):
+    day_map = {'monday':0,'tuesday':1,'wednesday':2,'thursday':3,'friday':4,'saturday':5,'sunday':6}
+    fd = first_day_name.lower()
+    if fd not in day_map:
+        raise ValueError(f"Invalid FIRST_DAY_OF_WEEK '{first_day_name}'. Choose {list(day_map)}")
+    first_idx = day_map[fd]
+    cur = start_date
+    while cur <= end_date:
+        end_of_week_idx = (first_idx - 1 + 7) % 7
+        days_to_eow = (end_of_week_idx - cur.weekday() + 7) % 7
+        wk_end = min(cur + datetime.timedelta(days=days_to_eow), end_date)
+        yield cur, wk_end
+        cur = wk_end + datetime.timedelta(days=1)
 
-@backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=5)
-def fetch_account_name(ad_account_id: str, access_token: str) -> str:
-    """Fetch ad account name from Facebook API"""
+def _filtering(campaign_contains: str):
+    s = str(campaign_contains or "").strip()
+    if not s:
+        return []
+    return [{"field": "campaign.name", "operator": "CONTAIN", "value": s}]
+
+def _insights_period(level, since, until, fields, filtering=None):
+    params = {
+        "level": level,
+        "time_range": {"since": since, "until": until},
+        "action_report_time": "impression",
+    }
+    if filtering:
+        params["filtering"] = filtering
+    rows = [dict(r) for r in account.get_insights(fields=fields, params=params)]
+    return rows[0] if rows else {}
+
+# Parse dates
+start_date = datetime.datetime.strptime(START_DATE_STR, "%Y-%m-%d").date()
+end_date   = datetime.datetime.strptime(END_DATE_STR,   "%Y-%m-%d").date()
+if start_date > end_date:
+    raise ValueError("START_DATE cannot be after END_DATE.")
+
+print(f"Weekly incremental reach for {account.get_id()}  |  {start_date} → {end_date}  |  Week start: {FIRST_DAY_OF_WEEK}")
+print("Campaign filter:", f'campaign.name CONTAIN "{CAMPAIGN_NAME_CONTAINS.strip()}"' if CAMPAIGN_NAME_CONTAINS.strip() else "(none) — whole account")
+
+flt = _filtering(CAMPAIGN_NAME_CONTAINS)
+
+# Fetch weekly + cumulative data
+results = []
+for wk_start, wk_end in _week_chunks(start_date, end_date, FIRST_DAY_OF_WEEK):
     try:
-        url = (
-            f"https://graph.facebook.com/{FACEBOOK_GRAPH_API_VERSION}/act_{ad_account_id}"
-            f"?fields=name"
-            f"&access_token={access_token}"
-        )
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        return response.json().get('name', 'Unknown Account')
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching account name for act_{ad_account_id}: {str(e)}")
-        return 'Unknown Account (Error)'
-    except json.JSONDecodeError as e:
-        print(f"Error decoding JSON response for account name (act_{ad_account_id}): {str(e)}")
-        return 'Unknown Account (JSON Error)'
-
-@backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=3, jitter=backoff.full_jitter)
-def fetch_insights_data(
-    ad_account_id: str,
-    access_token: str,
-    start_date: datetime.date,
-    end_date: datetime.date,
-    level: str = "account",
-    fields: Optional[List[str]] = None
-) -> Optional[Dict]:
-    """Fetch insights from Facebook API with retries"""
-    if fields is None:
-        fields = METRICS_TO_FETCH
-
-    try:
-        url = (
-            f"https://graph.facebook.com/{FACEBOOK_GRAPH_API_VERSION}/act_{ad_account_id}/insights"
-            f'?time_range={{"since":"{start_date.isoformat()}","until":"{end_date.isoformat()}"}}'
-            f"&level={level}"
-            f"&fields={','.join(fields)}"
-            f"&access_token={access_token}"
-        )
-        response = requests.get(url, timeout=45)
-        response.raise_for_status()
-        data = response.json().get('data', [])
-        return data[0] if data else {}
-    except requests.exceptions.Timeout:
-        print(f"API Request Timeout for act_{ad_account_id} ({start_date} to {end_date}).")
-        raise
-    except requests.exceptions.RequestException as e:
-        print(f"API Request Error for act_{ad_account_id} ({start_date} to {end_date}): {str(e)}")
-        raise
-    except json.JSONDecodeError as e:
-        print(f"Error decoding JSON response for insights (act_{ad_account_id}, {start_date}-{end_date}): {str(e)}")
-        return {}
-
-def get_fb_metrics_for_ad_account(
-    ad_account_id: str,
-    access_token: str,
-    start_date_config: datetime.date,
-    end_date_config: datetime.date,
-    first_day_of_week_config: str
-) -> List[Dict]:
-    """
-    Get metrics for a date range, aggregated into weekly chunks based on the configured first day of the week.
-    """
-    results = []
-    current_date = start_date_config
-
-    day_map = {'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 'friday': 4, 'saturday': 5, 'sunday': 6}
-    first_day_int = day_map[first_day_of_week_config.lower()]
-
-    print(f"Fetching weekly metrics for Ad Account: {ad_account_id}")
-    print(f"Date Range: {start_date_config.isoformat()} to {end_date_config.isoformat()}")
-    print(f"Aggregating weekly data with week starting on {first_day_of_week_config.capitalize()}.")
-
-    while current_date <= end_date_config:
-        end_of_week_weekday = (first_day_int - 1 + 7) % 7
-        days_until_end_of_week = (end_of_week_weekday - current_date.weekday() + 7) % 7
-
-        week_end = current_date + datetime.timedelta(days=days_until_end_of_week)
-
-        api_week_end = min(week_end, end_date_config)
-
-        print(f"  Processing period: {current_date.isoformat()} to {api_week_end.isoformat()}")
-
-        try:
-
-            weekly_metrics = fetch_insights_data(ad_account_id, access_token, current_date, api_week_end)
-
-
-            cumulative_reach_data = fetch_insights_data(
-                ad_account_id, access_token, start_date_config, api_week_end, fields=["reach"]
-            )
-
-            result = {
-                'date': current_date.strftime('%Y-%m-%d'),
-                'reach': int(weekly_metrics.get('reach', 0)),
-                'reach_for_date': int(cumulative_reach_data.get('reach', 0)),
-                'impressions': int(weekly_metrics.get('impressions', 0)),
-                'frequency': float(weekly_metrics.get('frequency', 0.0)),
-                'cpm': float(weekly_metrics.get('cpm', 0.0)),
-                'spend': float(weekly_metrics.get('spend', 0.0))
-            }
-            results.append(result)
-
-        except Exception as e:
-            print(f"Error fetching data for period starting {current_date.isoformat()}: {str(e)}")
-            print("  Adding row with zeros for this period.")
-            results.append({
-                'date': current_date.strftime('%Y-%m-%d'),
-                'reach': 0,
-                'reach_for_date': 0,
-                'impressions': 0,
-                'frequency': 0.0,
-                'cpm': 0.0,
-                'spend': 0.0
-            })
-
-
-        current_date = api_week_end + datetime.timedelta(days=1)
-
-    return results
-
-# Report Functions
-def generate_reach_report_pdf(input_data_for_report: dict, output_filename: str = "weekly_incremental_reach_report.pdf"):
-    """
-    Processes marketing data, generates a weekly incremental reach plot,
-    and saves it as a PDF.
-    """
-    try:
-        account_name_for_report = input_data_for_report.get('account_name', 'Unknown Account')
-        report_data_list = input_data_for_report.get('data')
-
-        if not report_data_list:
-            raise ValueError("Error: No 'data' list found in the input for report generation.")
-
-        df = pd.DataFrame(report_data_list)
-        if df.empty:
-            raise ValueError("Error: DataFrame is empty after parsing input data for report.")
-
-    except Exception as e:
-        print(f"Error parsing initial data for report: {str(e)}")
-        raise
-
-    # Data Processing
-    try:
-        df['reach'] = pd.to_numeric(df['reach'], errors='coerce').fillna(0).astype(int)
-        df['reach_for_date'] = pd.to_numeric(df['reach_for_date'], errors='coerce').fillna(0).astype(int)
-        df['date'] = pd.to_datetime(df['date'])
-
-        df.sort_values(by='date', inplace=True)
-        df_weekly = df.copy()
-
-        if df_weekly.empty:
-            print("Warning: DataFrame for report is empty. Check input data and date range.")
-            return
-
-        df_weekly['incremental_reach'] = 0
-        df_weekly['existing_reach'] = 0
-
-        df_weekly.sort_values(by='date', inplace=True)
-        df_weekly.reset_index(drop=True, inplace=True)
-
-        for i in range(len(df_weekly)):
-            current_weekly_reach = df_weekly.at[i, 'reach']
-            current_cumulative_reach = df_weekly.at[i, 'reach_for_date']
-
-            if i == 0:
-                df_weekly.at[i, 'incremental_reach'] = current_cumulative_reach
-                df_weekly.at[i, 'existing_reach'] = max(0, current_weekly_reach - df_weekly.at[i, 'incremental_reach'])
-            else:
-                prev_cumulative_reach = df_weekly.at[i-1, 'reach_for_date']
-                incremental = current_cumulative_reach - prev_cumulative_reach
-                df_weekly.at[i, 'incremental_reach'] = max(0, incremental)
-
-                existing = current_weekly_reach - df_weekly.at[i, 'incremental_reach']
-                df_weekly.at[i, 'existing_reach'] = max(0, existing)
-
-        df_weekly['total_bar_height_check'] = df_weekly['incremental_reach'] + df_weekly['existing_reach']
-
-        df_weekly['incremental_percentage'] = 0.0
-        df_weekly.loc[df_weekly['reach'] > 0, 'incremental_percentage'] = \
-            (df_weekly['incremental_reach'] / df_weekly['reach']) * 100
-        df_weekly['incremental_percentage'].fillna(0, inplace=True)
-        df_weekly['incremental_percentage'] = df_weekly['incremental_percentage'].clip(0, 100)
-
-
-    except Exception as e:
-        print(f"Error during data processing for report: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise
-
-    if df_weekly.empty:
-        print("No data to plot after processing for report.")
-        return
-
-    # Plot
-    try:
-        fig, ax1 = plt.subplots(figsize=(max(15, len(df_weekly) * 1.2), 9))
-        ax2 = ax1.twinx()
-
-
-        num_weeks = len(df_weekly['date'].unique())
-        bar_width_days = 5
-
-        bars1 = ax1.bar(df_weekly['date'], df_weekly['existing_reach'],
-                        width=datetime.timedelta(days=bar_width_days), label='Previously Reached', color='#4A90E2', alpha=0.8)
-        bars2 = ax1.bar(df_weekly['date'], df_weekly['incremental_reach'],
-                        width=datetime.timedelta(days=bar_width_days), bottom=df_weekly['existing_reach'],
-                        label='Incremental Reach', color='#7ED321', alpha=0.8)
-
-        line = ax2.plot(df_weekly['date'], df_weekly['incremental_percentage'],
-                        color='darkorange', marker='o', linestyle='-', linewidth=2, markersize=5, label='% Incremental')
-
-        def format_k(value):
-            if pd.isna(value): return ""
-            return f"{value/1000:.1f}k" if abs(value) >= 1000 else str(int(value))
-
-        for i, row in df_weekly.iterrows():
-            bar_bottom_val = 0
-            if row['existing_reach'] > 0.01 * (row['existing_reach'] + row['incremental_reach']):
-                ax1.text(row['date'], bar_bottom_val + row['existing_reach']/2,
-                         format_k(row['existing_reach']), ha='center', va='center', color='white', fontsize=7, fontweight='bold')
-            bar_bottom_val += row['existing_reach']
-            if row['incremental_reach'] > 0.01 * (row['existing_reach'] + row['incremental_reach']):
-                ax1.text(row['date'], bar_bottom_val + row['incremental_reach']/2,
-                         format_k(row['incremental_reach']), ha='center', va='center', color='white', fontsize=7, fontweight='bold')
-
-            if row['reach'] > 0:
-                 ax1.text(row['date'], row['reach'] * 1.02,
-                          f"Weekly: {format_k(row['reach'])}", ha='center', va='bottom', fontsize=7, color='dimgray')
-
-            date_str = row['date'].strftime('%m-%d')
-            ax1.text(row['date'], -max(df_weekly['reach'].max(), (df_weekly['existing_reach'] + df_weekly['incremental_reach']).max())*0.08,
-                     date_str, ha='center', va='top', rotation=45, fontsize=8)
-
-            if pd.notna(row['incremental_percentage']):
-                ax2.annotate(f"{row['incremental_percentage']:.0f}%",
-                             (row['date'], row['incremental_percentage']),
-                             xytext=(0, 10), textcoords='offset points',
-                             ha='center', va='bottom',
-                             bbox=dict(boxstyle="round,pad=0.3", fc='gold', alpha=0.7),
-                             fontsize=8)
-
-        ax1.set_xlabel('Start of Reporting Period', labelpad=45)
-        ax1.set_ylabel('Reach Count')
-        ax2.set_ylabel('% Incremental (of Weekly Reach)')
-
-
-        if num_weeks <= 12:
-            ax1.set_xticks(df_weekly['date'])
-            ax1.set_xticklabels([d.strftime('%Y-%m-%d') for d in df_weekly['date']], rotation=45, ha="right")
-        else:
-            plt.xticks(rotation=45, ha="right")
-        ax1.tick_params(axis='x', which='major', labelsize=8)
-
-
-        max_bar_height = (df_weekly['existing_reach'] + df_weekly['incremental_reach']).max()
-        max_weekly_reach = df_weekly['reach'].max()
-        ax1.set_ylim(0, max(max_bar_height, max_weekly_reach) * 1.20 if not df_weekly.empty else 10)
-        ax2.set_ylim(0, max(105, df_weekly['incremental_percentage'].max() * 1.15 if not df_weekly.empty and df_weekly['incremental_percentage'].max() > 0 else 105) )
-
-        handles1, labels1 = ax1.get_legend_handles_labels()
-        handles2, labels2 = ax2.get_legend_handles_labels()
-        fig.legend(handles1 + handles2, labels1 + labels2, loc='upper center', ncol=3, bbox_to_anchor=(0.5, 0.98), framealpha=0.7)
-
-        plt.title(f'Weekly Incremental Reach Analysis', pad=40, fontsize=16)
-        plt.grid(True, axis='y', linestyle='--', alpha=0.6)
-        plt.tight_layout(rect=[0, 0.05, 1, 0.90])
-
-        print("\n--- Plot Preview ---")
-        display(fig)
-
-        pdf_buffer = io.BytesIO()
-        with PdfPages(pdf_buffer) as pdf:
-            pdf.savefig(fig, bbox_inches='tight')
-        plt.close(fig)
-
-        with open(output_filename, 'wb') as f:
-            f.write(pdf_buffer.getvalue())
-        print(f"\nPDF report '{output_filename}' created successfully.")
-        files.download(output_filename)
-
-    except Exception as e:
-        print(f"Error generating plot or PDF: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        if 'fig' in locals() and fig: plt.close(fig)
-        raise
-
-def generate_spend_report_pdf(input_data_for_report: dict, output_filename: str = "weekly_spend_report.pdf"):
-    """
-    Processes marketing data, generates a weekly spend bar chart,
-    and saves it as a PDF.
-    """
-    try:
-        account_name_for_report = input_data_for_report.get('account_name', 'Unknown Account')
-        report_data_list = input_data_for_report.get('data')
-
-        if not report_data_list:
-            raise ValueError("Error: No 'data' list found in the input for spend report generation.")
-
-        df = pd.DataFrame(report_data_list)
-        if df.empty:
-            raise ValueError("Error: DataFrame is empty after parsing input data for spend report.")
-
-    except Exception as e:
-        print(f"Error parsing initial data for spend report: {str(e)}")
-        raise
-
-    # --- Data Processing for Spend Report ---
-    try:
-        df['spend'] = pd.to_numeric(df['spend'], errors='coerce').fillna(0)
-        df['date'] = pd.to_datetime(df['date'])
-        df.sort_values(by='date', inplace=True)
-        df.reset_index(drop=True, inplace=True)
-
-        if df.empty:
-            print("Warning: DataFrame for spend report is empty. Check input data and date range.")
-            return
-
-        # Calculate additional metrics
-        total_spend = df['spend'].sum()
-        avg_weekly_spend = df['spend'].mean() if not df.empty else 0
-        max_weekly_spend = df['spend'].max()
-        weeks_with_spend = (df['spend'] > 0).sum()
-
-        # Calculate cumulative spend
-        df['cumulative_spend'] = df['spend'].cumsum()
-
-    except Exception as e:
-        print(f"Error during data processing for spend report: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise
-
-    if df.empty:
-        print("No data to plot after processing for spend report.")
-        return
-
-    # Plot
-    try:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(max(15, len(df) * 1.2), 12))
-
-
-        num_weeks = len(df['date'].unique())
-        bar_width_days = 5
-
-
-        bars = ax1.bar(df['date'], df['spend'],
-                      width=datetime.timedelta(days=bar_width_days),
-                      color='#E74C3C', alpha=0.8, edgecolor='darkred', linewidth=1)
-
-
-        fmt = '${x:,.0f}'
-        tick = mtick.StrMethodFormatter(fmt)
-        ax1.yaxis.set_major_formatter(tick)
-
-
-        for i, (bar, value) in enumerate(zip(bars, df['spend'])):
-            if value > 0:
-                if value >= 1000:
-                    spend_label = f'${value:,.0f}'
-                else:
-                    spend_label = f'${value:.2f}'
-
-                ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(df['spend'].max(), 1) * 0.01,
-                        spend_label, ha='center', va='bottom', fontweight='bold', fontsize=8)
-
-
-                date_str = df.iloc[i]['date'].strftime('%m-%d')
-                ax1.text(bar.get_x() + bar.get_width()/2, -max(df['spend'].max(), 1) * 0.05,
-                        date_str, ha='center', va='top', rotation=45, fontsize=8)
-
-        ax1.set_title(f'{account_name_for_report} - Weekly Ad Spend', fontsize=14, fontweight='bold', pad=20)
-        ax1.set_ylabel('Weekly Spend ($)', fontweight='bold')
-        ax1.grid(True, axis='y', linestyle='--', alpha=0.6)
-
-
-        max_spend = df['spend'].max()
-        ax1.set_ylim(0, max_spend * 1.15 if max_spend > 0 else 100)
-
-
-        if num_weeks <= 12:
-            ax1.set_xticks(df['date'])
-            ax1.set_xticklabels([d.strftime('%Y-%m-%d') for d in df['date']], rotation=45, ha="right")
-        else:
-            ax1.tick_params(axis='x', rotation=45)
-
-
-        ax2.plot(df['date'], df['cumulative_spend'],
-                color='#2E86AB', marker='o', linewidth=3, markersize=6, alpha=0.8)
-        ax2.fill_between(df['date'], df['cumulative_spend'], alpha=0.3, color='#2E86AB')
-
-
-        ax2.yaxis.set_major_formatter(tick)
-
-
-        for i, row in df.iterrows():
-            if i % max(1, len(df) // 8) == 0 or i == len(df) - 1:
-                cum_spend_label = f'${row["cumulative_spend"]:,.0f}'
-                ax2.annotate(cum_spend_label,
-                           (row['date'], row['cumulative_spend']),
-                           xytext=(0, 10), textcoords='offset points',
-                           ha='center', va='bottom',
-                           bbox=dict(boxstyle="round,pad=0.3", fc='lightblue', alpha=0.7),
-                           fontsize=8)
-
-        ax2.set_title('Cumulative Ad Spend', fontsize=14, fontweight='bold')
-        ax2.set_xlabel('Reporting Period Start Date', fontweight='bold')
-        ax2.set_ylabel('Cumulative Spend ($)', fontweight='bold')
-        ax2.grid(True, linestyle='--', alpha=0.6)
-
-
-        if num_weeks <= 12:
-            ax2.set_xticks(df['date'])
-            ax2.set_xticklabels([d.strftime('%Y-%m-%d') for d in df['date']], rotation=45, ha="right")
-        else:
-            ax2.tick_params(axis='x', rotation=45)
-
-
-        stats_text = f"""Summary Statistics:
-Total Spend: ${total_spend:,.2f}
-Average Period Spend: ${avg_weekly_spend:,.2f}
-Highest Period Spend: ${max_weekly_spend:,.2f}
-Periods with Spend: {weeks_with_spend}"""
-
-        ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes, fontsize=10,
-                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
-        plt.tight_layout()
-
-        print("\n--- Spend Report Plot Preview ---")
-        display(fig)
-
-        # Save to PDF
-        pdf_buffer = io.BytesIO()
-        with PdfPages(pdf_buffer) as pdf:
-            pdf.savefig(fig, bbox_inches='tight')
-        plt.close(fig)
-
-        with open(output_filename, 'wb') as f:
-            f.write(pdf_buffer.getvalue())
-        print(f"\nSpend PDF report '{output_filename}' created successfully.")
-        files.download(output_filename)
-
-    except Exception as e:
-        print(f"Error generating spend plot or PDF: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        if 'fig' in locals() and fig: plt.close(fig)
-        raise
-
-# Main Execution
-if __name__ == "__main__" and 'google.colab' in str(get_ipython()):
-    print("--- Script Execution Started ---")
-
-    try:
-        # --- Configuration Validation ---
-        print("Validating configuration...")
-        if not all([AD_ACCOUNT_ID_STR, START_DATE_STR, END_DATE_STR, ACCESS_TOKEN_STR, FIRST_DAY_OF_WEEK]):
-            raise ValueError("One or more configuration strings (ID, Dates, Token, First Day of Week) are empty.")
-        if ACCESS_TOKEN_STR == "YOUR_FACEBOOK_ACCESS_TOKEN_HERE":
-            raise ValueError("Please replace 'YOUR_FACEBOOK_ACCESS_TOKEN_HERE' with your actual token.")
-        if AD_ACCOUNT_ID_STR == "YOUR_AD_ACCOUNT_ID":
-            raise ValueError("Please replace 'YOUR_AD_ACCOUNT_ID' with your actual Ad Account ID.")
-
-        valid_days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
-        if FIRST_DAY_OF_WEEK.lower() not in valid_days:
-            raise ValueError(f"Invalid FIRST_DAY_OF_WEEK: '{FIRST_DAY_OF_WEEK}'. Please choose from {valid_days}.")
-
-        parsed_access_token = ACCESS_TOKEN_STR
-        parsed_ad_account_id = AD_ACCOUNT_ID_STR
-        parsed_start_date = datetime.datetime.strptime(START_DATE_STR, '%Y-%m-%d').date()
-        parsed_end_date = datetime.datetime.strptime(END_DATE_STR, '%Y-%m-%d').date()
-        parsed_first_day_of_week = FIRST_DAY_OF_WEEK
-
-        if parsed_start_date > parsed_end_date:
-            raise ValueError("START_DATE cannot be after END_DATE.")
-        print("Configuration validated successfully.")
-
-        # --- Fetch Facebook Data ---
-        print("\n--- Fetching Facebook Ads Data ---")
-        fetched_account_name = fetch_account_name(parsed_ad_account_id, parsed_access_token)
-        print(f"Account Name: {fetched_account_name}")
-
-        if "Error" in fetched_account_name or "Unknown" in fetched_account_name :
-             print(f"Warning: Could not reliably fetch account name. Proceeding with '{fetched_account_name}'.")
-
-        fb_metrics_list = get_fb_metrics_for_ad_account(
-            ad_account_id=parsed_ad_account_id,
-            access_token=parsed_access_token,
-            start_date_config=parsed_start_date,
-            end_date_config=parsed_end_date,
-            first_day_of_week_config=parsed_first_day_of_week
-        )
-
-        if not fb_metrics_list:
-            print("No metrics data was fetched from Facebook. Report generation will be skipped.")
-        else:
-            print(f"\nSuccessfully fetched {len(fb_metrics_list)} reporting periods from Facebook.")
-            df_fetched = pd.DataFrame(fb_metrics_list)
-            print("\n--- Preview of Fetched Facebook Data ---")
-            display(df_fetched.head())
-
-            # Generate Reports
-            print("\n--- Generating PDF Reports ---")
-            data_for_report_generation = {
-                'account_name': fetched_account_name,
-                'data': fb_metrics_list
-            }
-
-            # Generate Reach Report
-            reach_report_filename = f"fb_reach_report_{parsed_ad_account_id}_{parsed_start_date}_to_{parsed_end_date}.pdf"
-            generate_reach_report_pdf(data_for_report_generation, output_filename=reach_report_filename)
-
-            # Generate Spend Report
-            spend_report_filename = f"fb_spend_report_{parsed_ad_account_id}_{parsed_start_date}_to_{parsed_end_date}.pdf"
-            generate_spend_report_pdf(data_for_report_generation, output_filename=spend_report_filename)
-
-        print("\n--- Script Execution Finished ---")
-
-    except ValueError as ve:
-        print(f"\nConfiguration or Value Error: {str(ve)}")
-    except requests.exceptions.RequestException as re:
-        print(f"\nA critical API request failed after retries: {str(re)}")
-        if re.response is not None:
-            print(f"Response content: {re.response.text}")
-    except Exception as e:
-        print(f"\nAn unexpected error occurred during script execution: {str(e)}")
-        import traceback
-        traceback.print_exc()
-
+        weekly = _insights_period("account", wk_start.isoformat(), wk_end.isoformat(), METRICS_TO_FETCH, filtering=flt)
+        cumulative = _insights_period("account", start_date.isoformat(), wk_end.isoformat(), ["reach"], filtering=flt)
+        results.append({
+            "date": wk_start.strftime("%Y-%m-%d"),
+            "reach": int(float(weekly.get("reach", 0) or 0)),
+            "reach_for_date": int(float(cumulative.get("reach", 0) or 0)),
+            "impressions": int(float(weekly.get("impressions", 0) or 0)),
+            "frequency": float(weekly.get("frequency", 0.0) or 0.0),
+            "cpm": float(weekly.get("cpm", 0.0) or 0.0),
+            "spend": float(weekly.get("spend", 0.0) or 0.0),
+        })
+    except FacebookRequestError as e:
+        print(f"[API] {wk_start}→{wk_end} failed: {e}; filling zeros.")
+        results.append({
+            "date": wk_start.strftime("%Y-%m-%d"),
+            "reach": 0, "reach_for_date": 0, "impressions": 0,
+            "frequency": 0.0, "cpm": 0.0, "spend": 0.0
+        })
+
+df = pd.DataFrame(results)
+if df.empty:
+    print("No rows returned for the given range/filter.")
 else:
-    print("This script is designed primarily for Google Colab.")
-    print("If running locally, ensure all dependencies are installed and adjust configurations if needed.")
+    # Clean/order
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # Weekly metrics table
+    weekly_cols = ["date", "reach", "reach_for_date", "impressions", "frequency", "cpm", "spend"]
+    weekly_tbl = df[weekly_cols].copy()
+    styled_weekly = (
+        weekly_tbl.style
+        .format({
+            "date": lambda d: pd.to_datetime(d).strftime("%Y-%m-%d"),
+            "reach": "{:,.0f}".format,
+            "reach_for_date": "{:,.0f}".format,
+            "impressions": "{:,.0f}".format,
+            "frequency": "{:,.2f}".format,
+            "cpm": "{:,.2f}".format,
+            "spend": "£{:,.2f}".format,  
+        })
+    )
+    print("\nWeekly metrics:")
+    display(styled_weekly)
+
+    # Incremental reach breakdown (weekly)
+    df_ir = df.copy()
+    df_ir["incremental_reach"] = 0
+    df_ir["existing_reach"] = 0
+    df_ir.reset_index(drop=True, inplace=True)
+
+    for i in range(len(df_ir)):
+        wk = df_ir.at[i, "reach"]
+        cum = df_ir.at[i, "reach_for_date"]
+        incr = cum if i == 0 else max(0, cum - df_ir.at[i-1, "reach_for_date"])
+        df_ir.at[i, "incremental_reach"] = max(0, incr)
+        df_ir.at[i, "existing_reach"] = max(0, wk - incr)
+
+    df_ir["incremental_pct"] = np.where(df_ir["reach"] > 0,
+                                        (df_ir["incremental_reach"] / df_ir["reach"]) * 100, 0.0)
+
+    incr_cols = ["date", "reach", "incremental_reach", "existing_reach", "incremental_pct"]
+    incr_tbl = df_ir[incr_cols].copy()
+    styled_incr = (
+        incr_tbl.style
+        .format({
+            "date": lambda d: pd.to_datetime(d).strftime("%Y-%m-%d"),
+            "reach": "{:,.0f}".format,
+            "incremental_reach": "{:,.0f}".format,
+            "existing_reach": "{:,.0f}".format,
+            "incremental_pct": "{:,.1f}%".format,
+        })
+    )
+    print("\nIncremental reach breakdown (per week):")
+    display(styled_incr)
+
+    # Spend summary with cumulative spend
+    df_sp = df.copy()
+    df_sp["cumulative_spend"] = df_sp["spend"].cumsum()
+    spend_cols = ["date", "spend", "cumulative_spend"]
+    spend_tbl = df_sp[spend_cols].copy()
+    styled_spend = (
+        spend_tbl.style
+        .format({
+            "date": lambda d: pd.to_datetime(d).strftime("%Y-%m-%d"),
+            "spend": "£{:,.2f}".format,
+            "cumulative_spend": "£{:,.2f}".format,
+        })
+    )
+    print("\nWeekly spend (with cumulative):")
+    display(styled_spend)
+
+    # Create raw frames
+    weekly_metrics_df = weekly_tbl.copy()
+    incremental_reach_df = incr_tbl.copy()
+    weekly_spend_df = spend_tbl.copy()
